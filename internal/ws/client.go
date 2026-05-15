@@ -180,32 +180,42 @@ func (c *Client) WritePump(ctx context.Context) {
 
 // ServeWS upgrades HTTP to WebSocket and starts pumps.
 func ServeWS(
-	ctx context.Context,
-	w http.ResponseWriter,
-	r *http.Request,
-	hub *Hub,
-	userID string,
-	onConnect func(ctx context.Context, userID string),
-	onClaim ClaimHandler,
-	onDisconnect func(ctx context.Context, userID string),
-	log *slog.Logger,
+    ctx context.Context,  // this is r.Context() — don't pass it to pumps
+    w http.ResponseWriter,
+    r *http.Request,
+    hub *Hub,
+    userID string,
+    onConnect func(ctx context.Context, userID string),
+    onClaim ClaimHandler,
+    onDisconnect func(ctx context.Context, userID string),
+    log *slog.Logger,
 ) error {
-	if userID == "" {
-		return errors.New("missing user")
-	}
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return err
-	}
-	if onConnect != nil {
-		onConnect(ctx, userID)
-	}
-	client := NewClient(hub, conn, userID, onClaim, onDisconnect, log)
-	hub.Register(client)
+    if userID == "" {
+        return errors.New("missing user")
+    }
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        return err
+    }
 
-	go client.WritePump(ctx)
-	go client.ReadPump(ctx)
-	return nil
+    // Using a fresh background context for the WS lifetime,
+    // not r.Context() which dies when the HTTP handler returns.
+    wsCtx, wsCancel := context.WithCancel(context.Background())
+
+    if onConnect != nil {
+        onConnect(ctx, userID) // still use request ctx for the connect call
+    }
+
+    client := NewClient(hub, conn, userID, onClaim, onDisconnect, log)
+    hub.Register(client)
+
+    go client.WritePump(wsCtx)
+    go func() {
+        defer wsCancel() // cancel wsCtx when ReadPump exits (cleans up WritePump too)
+        client.ReadPump(wsCtx)
+    }()
+
+    return nil
 }
 
 // Marshal helpers for outbound payloads.
