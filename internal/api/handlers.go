@@ -34,15 +34,15 @@ func (d *Deps) log() *slog.Logger {
 }
 
 // Router returns the application HTTP mux.
-func (d *Deps) Router() http.Handler {
+func (d *Deps) Router(ctx context.Context) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", d.handleHealth)
-	mux.HandleFunc("POST /api/join", d.handleJoin)
-	mux.HandleFunc("GET /api/grid", d.handleGetGrid)
-	mux.HandleFunc("GET /api/leaderboard", d.handleLeaderboard)
-	mux.HandleFunc("POST /api/reset", d.handleReset)
-	mux.HandleFunc("GET /ws", d.handleWS())
-	return d.withCORS(d.withRequestTimeout(mux))
+	mux.HandleFunc("POST /api/join", d.withCORS(d.handleJoin))
+	mux.HandleFunc("GET /api/grid", d.withCORS(d.handleGetGrid))
+	mux.HandleFunc("GET /api/leaderboard", d.withCORS(d.handleLeaderboard))
+	mux.HandleFunc("POST /api/reset", d.withCORS(d.handleReset))
+	mux.HandleFunc("GET /ws", d.withCORS(d.handleWS()))
+	return d.withRequestContext(ctx, mux)
 }
 
 func (d *Deps) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -201,12 +201,12 @@ func (d *Deps) wsOnClaim(ctx context.Context, userID string, cellID int, c *ws.C
 		return
 	}
 	if !ok {
-		// b, err := ws.RejectMessage(cellID)
-		// if err != nil {
-		// 	d.log().Error("reject marshal failed", "err", err)
-		// 	return
-		// }
-		// c.Send(b)
+		b, err := ws.RejectMessage(cellID)
+		if err != nil {
+			d.log().Error("reject marshal failed", "err", err)
+			return
+		}
+		c.Send(b)
 		return
 	}
 
@@ -236,8 +236,8 @@ func (d *Deps) wsOnClaim(ctx context.Context, userID string, cellID int, c *ws.C
 	d.Hub.Broadcast(lb)
 }
 
-func (d *Deps) withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (d *Deps) withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key")
@@ -245,11 +245,12 @@ func (d *Deps) withCORS(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		next(w, r)
+	}
 }
 
-func (d *Deps) withRequestTimeout(next http.Handler) http.Handler {
+func (d *Deps) withRequestContext(base context.Context, next http.Handler) http.Handler {
+	_ = base
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
 		defer cancel()
