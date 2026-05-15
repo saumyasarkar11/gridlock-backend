@@ -200,15 +200,15 @@ func (d *Deps) wsOnClaim(ctx context.Context, userID string, cellID int, c *ws.C
 		d.log().Warn("claim failed", "userId", userID, "cellId", cellID, "err", err)
 		return
 	}
-	if !ok {
-		b, err := ws.RejectMessage(cellID)
-		if err != nil {
-			d.log().Error("reject marshal failed", "err", err)
-			return
-		}
-		c.Send(b)
-		return
-	}
+	// if !ok {
+	// 	b, err := ws.RejectMessage(cellID)
+	// 	if err != nil {
+	// 		d.log().Error("reject marshal failed", "err", err)
+	// 		return
+	// 	}
+	// 	c.Send(b)
+	// 	return
+	// }
 
 	cellPayload, err := ws.CellUpdateMessage(cellID, userID, color)
 	if err != nil {
