@@ -1,124 +1,188 @@
-# Gridlock backend
+# Gridlock Backend
 
-Production-oriented Go service for **Gridlock**, a real-time shared grid where users claim cells. REST covers snapshots and onboarding; **WebSockets are only used for live grid claims, presence, and leaderboard refresh signals**.
+Backend service for Gridlock, a real-time shared grid application where users claim cells and see updates live across connected clients.
 
-## Tech stack
+## Tech Stack
 
-- Go 1.22+
-- `net/http` (no Gin/Fiber/Echo)
-- `github.com/gorilla/websocket`
-- Redis via `github.com/redis/go-redis/v9`
-- Structured logging with `log/slog`
+* Go 1.22+
+* `net/http`
+* `github.com/gorilla/websocket`
+* Redis via `github.com/redis/go-redis/v9`
+* Structured logging with `log/slog`
 
-## Folder structure
+## Folder Structure
 
 ```text
 backend/
-  cmd/server/main.go          # process entry: wiring, signals, subscriber
+  cmd/server/main.go          # Process entrypoint
   internal/
-    api/handlers.go           # REST + WebSocket upgrade route
-    game/game.go              # domain: join, claim, leaderboard, snapshots
-    redis/redis.go            # Redis keys, atomic claim, pub/sub
-    ws/hub.go                 # fan-out hub
-    ws/client.go              # connection read/write pumps
-    models/models.go          # shared DTOs / wire types
+    api/handlers.go           # REST handlers + WebSocket upgrade route
+    game/game.go              # Join, claim, leaderboard, snapshots
+    redis/redis.go            # Redis operations and pub/sub
+    ws/hub.go                 # WebSocket hub
+    ws/client.go              # Connection read/write pumps
+    models/models.go          # Shared DTOs and message types
   go.mod
   .env.example
   README.md
 ```
 
-## Redis schema
+## Architecture Decisions
 
-| Key / channel | Type | Purpose |
-|---------------|------|---------|
-| `grid:state` | **HASH** | Field `cellId` (string) → `userId`. Authoritative ownership. |
-| `user:<userId>` | **HASH** | `firstName`, `color`, `avatar`, `isOnline` (`0`/`1`), `lastSeenAt` (unix ms). |
-| `grid:users` | **SET** | All user ids that have joined (drives leaderboard rows with zero cells). |
-| `grid:color_seq` | **STRING** (INCR) | Monotonic sequence for deterministic distinct HSL colors. |
-| `ws:token:<token>` | **STRING** with TTL | Maps short-lived WebSocket token → `userId` (not JWT). |
-| `grid:events` | **PUB/SUB channel** | JSON `GridEvent` payloads for cross-node replay (same process skips self-origin). |
+* Redis HASH (`grid:state`) stores authoritative ownership state
+* Redis Pub/Sub distributes transient real-time events between nodes
+* REST is used for onboarding and snapshot retrieval
+* WebSockets are limited to live updates and presence events
+* Ownership persists after disconnect
+* Presence is tracked separately from ownership
+* Cell claims are resolved atomically using Redis `HSETNX`
 
-**Conflict resolution:** successful claims use **`HSETNX`** on `grid:state` so exactly one writer wins per cell; losers get a WebSocket `reject` message only to that client.
+## Redis Schema
 
-## WebSocket hub
+| Key / Channel      | Type            | Purpose                                                          |
+| ------------------ | --------------- | ---------------------------------------------------------------- |
+| `grid:state`       | HASH            | Field `cellId` → `userId`. Stores authoritative ownership state. |
+| `user:<userId>`    | HASH            | Stores `firstName`, `color`, `avatar`, `isOnline`, `lastSeenAt`. |
+| `grid:users`       | SET             | Tracks all users who have joined.                                |
+| `grid:color_seq`   | STRING (INCR)   | Generates deterministic unique HSL colors.                       |
+| `ws:token:<token>` | STRING with TTL | Maps temporary WebSocket token → `userId`.                       |
+| `grid:events`      | PUB/SUB channel | Broadcasts transient real-time grid events.                      |
 
-Canonical pattern in `internal/ws/hub.go`:
+## Conflict Resolution
 
-- `register` / `unregister` / `broadcast` channels
-- `Run()` goroutine owns the `clients` map under a mutex
-- `Broadcast` delivers JSON payloads to every connected client’s outbound buffer
+Cell ownership uses Redis atomic operations:
 
-Clients are goroutines with `ReadPump` (claims) and `WritePump` (fan-out + ping).
+```text
+HSETNX grid:state <cellId> <userId>
+```
 
-## Claim flow (atomic + pub/sub)
+* `1` → claim succeeds
+* `0` → claim rejected because another user already owns the cell
 
-1. Client sends `{ "type": "claim", "cellId": <n>, "userId": "<ignored for auth>" }` over the socket.  
-   The server **binds the claim to the authenticated user** from `?token=...` (the `userId` field in the message is ignored for authorization).
-2. `HSETNX grid:state <cellId> <userId>`  
-   - `1` → success: broadcast `cell_update`, publish `grid:events` JSON (includes `origin` instance id), broadcast `leaderboard_update`.  
-   - `0` → failure: send `reject` **only** to that socket.
+This guarantees that only one user can successfully claim a cell during concurrent clicks.
 
-**Same-node optimization:** the winning path broadcasts immediately to the local hub **and** publishes to Redis. The in-process subscriber ignores messages where `origin` equals this server’s `GRIDLOCK_INSTANCE_ID` to avoid duplicate local delivery; another node would only receive via Redis and then broadcast locally.
+## WebSocket Hub
+
+The WebSocket hub manages:
+
+* connected clients
+* registration and disconnects
+* outbound broadcasts
+
+Each client connection runs:
+
+* `ReadPump` for incoming claim messages
+* `WritePump` for outbound broadcasts and ping/pong handling
+
+## Claim Flow
+
+1. Client sends:
+
+```json
+{
+  "type": "claim",
+  "cellId": 42
+}
+```
+
+2. Backend attempts:
+
+```text
+HSETNX grid:state 42 <userId>
+```
+
+3. If successful:
+
+   * broadcast `cell_update` locally
+   * publish event to Redis `grid:events`
+   * broadcast `leaderboard_update`
+
+4. If rejected:
+
+   * send `reject` only to that socket
+
+Successful claims are broadcast locally immediately and also published to Redis.
+The Redis subscriber ignores events originating from the same instance to avoid duplicate broadcasts.
 
 ## REST API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/join` | Body: `{"firstName":"..."}`. Creates user (UUID, HSL color, random animal avatar), stores in Redis, returns `userId`, `firstName`, `color`, `avatar`, `wsToken`. |
-| `GET` | `/api/grid` | Full grid snapshot: cells with `cellId`, `userId`, `color`. |
-| `GET` | `/api/leaderboard` | Users sorted by `ownedCellCount` desc; includes `firstName`, `avatar`, `color`, `ownedCellCount`, `isOnline`. |
-| `POST` | `/api/reset` | Clears `grid:state`. Header `X-Admin-Key` must match `GRIDLOCK_ADMIN_KEY`. Broadcasts `leaderboard_update` to live clients (refetch grid + leaderboard via REST). |
-| `GET` | `/health` | `{"status":"ok"}`. |
+| Method | Path               | Description                                                            |
+| ------ | ------------------ | ---------------------------------------------------------------------- |
+| `POST` | `/api/join`        | Creates a user and returns `userId`, `color`, `avatar`, and `wsToken`. |
+| `GET`  | `/api/grid`        | Returns current grid snapshot.                                         |
+| `GET`  | `/api/leaderboard` | Returns users sorted by owned cell count.                              |
+| `POST` | `/api/reset`       | Clears the grid. Requires `X-Admin-Key`.                               |
+| `GET`  | `/health`          | Health check endpoint.                                                 |
 
 ## WebSocket
 
-After join, connect:
+After joining:
 
-`ws://localhost:8080/ws?token=<wsToken>`
+```text
+ws://localhost:8080/ws?token=<wsToken>
+```
 
-Message types match the product spec (`cell_update`, `reject`, `presence`, `leaderboard_update`).
+WebSocket message types:
 
-**Ownership vs presence:** disconnect sets `isOnline=false` and broadcasts `presence` offline; **cells stay owned** in `grid:state`.
+* `cell_update`
+* `reject`
+* `presence`
+* `leaderboard_update`
+
+Disconnecting a client:
+
+* marks user as offline
+* broadcasts presence update
+* preserves owned cells
 
 ## Configuration
 
-See `.env.example`. Environment variables:
+Environment variables:
 
-- `HTTP_ADDR` — listen address (default `:8080`).
-- `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` — Redis client options.
-- `GRIDLOCK_ADMIN_KEY` — required for `/api/reset` (constant-time compare); if unset, reset is always forbidden.
-- `GRIDLOCK_INSTANCE_ID` — optional; defaults to a random UUID per process (used for pub/sub de-duplication).
-- `WS_TOKEN_TTL_HOURS` — token TTL (default 24).
+| Variable               | Description                                    |
+| ---------------------- | ---------------------------------------------- |
+| `HTTP_ADDR`            | HTTP listen address                            |
+| `REDIS_ADDR`           | Redis address                                  |
+| `REDIS_PASSWORD`       | Redis password                                 |
+| `REDIS_DB`             | Redis database                                 |
+| `GRIDLOCK_ADMIN_KEY`   | Admin key for `/api/reset`                     |
+| `GRIDLOCK_INSTANCE_ID` | Instance identifier for pub/sub de-duplication |
+| `WS_TOKEN_TTL_HOURS`   | WebSocket token expiration                     |
 
-## Local development
+## Local Development
 
-1. Install **Go 1.22+** and **Redis** (local or Docker).
-2. Copy env file (optional):
+Install:
 
-   ```bash
-   cp .env.example .env
-   ```
+* Go 1.22+
+* Redis
 
-   Set `GRIDLOCK_ADMIN_KEY` if you need `/api/reset`.
+Copy environment file:
 
-3. From `backend/`:
+```bash
+cp .env.example .env
+```
 
-   ```bash
-   go run ./cmd/server
-   ```
+Run backend:
 
-4. Smoke test:
+```bash
+go run ./cmd/server
+```
 
-   ```bash
-   curl -s -X POST localhost:8080/api/join -H "Content-Type: application/json" -d "{\"firstName\":\"Ada\"}"
-   curl -s localhost:8080/api/grid
-   curl -s localhost:8080/api/leaderboard
-   ```
+Smoke test:
 
-5. WebSocket: use a client or browser with the returned `wsToken` query parameter.
+```bash
+curl -X POST localhost:8080/api/join \
+  -H "Content-Type: application/json" \
+  -d '{"firstName":"Ada"}'
 
-## Production notes
+curl localhost:8080/api/grid
 
-- Terminate TLS at a reverse proxy (recommended).
-- Restrict `Access-Control-Allow-Origin` in `internal/api/handlers.go` instead of `*` when you have fixed front-end origins.
-- Tune Redis persistence (AOF/RDB) according to how durable you need cell ownership to be across Redis restarts.
+curl localhost:8080/api/leaderboard
+```
+
+## Deployment Notes
+
+* Redis should only be accessible locally
+* TLS termination should happen at a reverse proxy such as Nginx
+* Restrict CORS origins when frontend origin is fixed
+* WebSocket traffic should be proxied through Nginx using upgrade headers
