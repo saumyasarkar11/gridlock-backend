@@ -65,7 +65,7 @@ func main() {
 
 	go runGridSubscriber(ctx, log, rdb, instanceID, hub)
 
-	handler := deps.Router()
+	handler := deps.Router(ctx)
 	log.Info("gridlock listening", "addr", httpAddr, "instanceId", instanceID)
 	if err := api.ListenAndServe(ctx, httpAddr, handler); err != nil && err != context.Canceled {
 		log.Error("server stopped", "err", err)
