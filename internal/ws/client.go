@@ -228,9 +228,9 @@ func CellUpdateMessage(cellID int, userID, color string) ([]byte, error) {
 	})
 }
 
-func RejectMessage(cellID int) ([]byte, error) {
-	return json.Marshal(models.Reject{Type: "reject", CellID: cellID})
-}
+// func RejectMessage(cellID int) ([]byte, error) {
+// 	return json.Marshal(models.Reject{Type: "reject", CellID: cellID})
+// }
 
 func PresenceMessage(userID, status string) ([]byte, error) {
 	return json.Marshal(models.Presence{Type: "presence", UserID: userID, Status: status})
